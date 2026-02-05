@@ -2,8 +2,8 @@ name: HOT Tasking Manager Cloud Native Mirror Sync
 
 on:
   schedule:
-    # Run every 10 minutes
-    - cron: "*/10 * * * *"
+    # Run every hour
+    - cron: "0 * * * *"
   workflow_dispatch:
     # Allow manual trigger
 

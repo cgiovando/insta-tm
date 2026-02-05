@@ -248,6 +248,12 @@ def run_etl():
 
     logger.info(f"{len(projects_to_update)} projects need updating")
 
+    # If no projects need updating, skip everything
+    if not projects_to_update:
+        logger.info("No changes detected, skipping uploads")
+        logger.info("ETL complete!")
+        return
+
     # Fetch and upload updated project details
     updated_projects = []
     for project_id, last_updated in projects_to_update:

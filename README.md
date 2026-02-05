@@ -85,12 +85,13 @@ const map = new maplibregl.Map({
 
 ## How It Works
 
-1. **GitHub Actions** runs the ETL script every 10 minutes
+1. **GitHub Actions** runs the ETL script every hour
 2. The script fetches the project list from the HOT Tasking Manager API
 3. **Incremental sync** compares `lastUpdated` timestamps against stored state
 4. Only changed projects are fetched in full and uploaded to S3
-5. All project geometries are combined into a single GeoJSON file
+5. If changes were detected, all project geometries are combined into a single GeoJSON file
 6. **Tippecanoe** generates PMTiles (zoom 0-12) for vector tile access
+7. If no changes are detected, the script exits early to minimize S3 PUT requests
 
 ## Tech Stack
 
