@@ -85,7 +85,7 @@ const map = new maplibregl.Map({
 
 ## How It Works
 
-1. **GitHub Actions** runs the ETL script every hour
+1. **GitHub Actions** runs the ETL script daily (06:00 UTC)
 2. The script fetches the project list from the HOT Tasking Manager API
 3. **Incremental sync** compares `lastUpdated` timestamps against stored state
 4. Only changed projects are fetched in full and uploaded to S3
