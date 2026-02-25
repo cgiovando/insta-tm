@@ -9,6 +9,7 @@ cloud-native formats, and uploads to S3 (or S3-compatible storage like Source.co
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -19,6 +20,8 @@ from typing import Any
 import boto3
 import requests
 from botocore.config import Config
+from pyproj import Geod
+from shapely.geometry import shape
 
 # Configure logging
 logging.basicConfig(
@@ -34,6 +37,61 @@ PROJECTS_ENDPOINT = f"{HOT_API_BASE}/projects/"
 STATE_FILE_KEY = "state.json"
 ALL_PROJECTS_GEOJSON = "all_projects.geojson"
 PMTILES_OUTPUT = "projects.pmtiles"
+PROJECTS_SUMMARY = "projects_summary.json"
+
+# Geodesic calculator for area computation
+GEOD = Geod(ellps="WGS84")
+
+# Imagery normalization patterns
+IMAGERY_PATTERNS = [
+    (re.compile(r"bing", re.IGNORECASE), "Bing"),
+    (re.compile(r"esri|arcgis|world.imagery", re.IGNORECASE), "Esri"),
+    (re.compile(r"mapbox", re.IGNORECASE), "Mapbox"),
+    (re.compile(r"maxar|digitalglobe|vivid|securewatch", re.IGNORECASE), "Maxar"),
+    (re.compile(r"openaerialmap|oam|open.aerial", re.IGNORECASE), "Custom"),
+    (re.compile(r"custom", re.IGNORECASE), "Custom"),
+]
+
+
+def normalize_imagery(raw: str | None) -> str:
+    """Normalize raw imagery value to a standard category."""
+    if not raw or raw.strip() == "":
+        return "Not specified"
+
+    raw_stripped = raw.strip()
+
+    for pattern, category in IMAGERY_PATTERNS:
+        if pattern.search(raw_stripped):
+            return category
+
+    # If it looks like a URL or TMS spec but doesn't match known patterns
+    if raw_stripped.startswith(("http://", "https://", "tms[")):
+        return "Other"
+
+    return "Other"
+
+
+def compute_area_sqkm(geojson_geometry: dict) -> float | None:
+    """Compute geodesic area in square kilometers from a GeoJSON geometry."""
+    try:
+        geom = shape(geojson_geometry)
+        # Geod.geometry_area_perimeter returns (area, perimeter) in sq meters
+        area_sqm, _ = GEOD.geometry_area_perimeter(geom)
+        return round(abs(area_sqm) / 1_000_000, 2)  # Convert to sq km
+    except Exception as e:
+        logger.debug(f"Area computation failed: {e}")
+        return None
+
+
+def compute_centroid(geojson_geometry: dict) -> tuple[float, float] | None:
+    """Compute centroid [lon, lat] from a GeoJSON geometry."""
+    try:
+        geom = shape(geojson_geometry)
+        centroid = geom.centroid
+        return (round(centroid.x, 4), round(centroid.y, 4))
+    except Exception as e:
+        logger.debug(f"Centroid computation failed: {e}")
+        return None
 
 
 class S3Client:
@@ -110,6 +168,7 @@ class HOTApiClient:
         params = {
             "orderBy": "last_updated",
             "orderByType": "DESC",
+            "projectStatuses": "PUBLISHED,ARCHIVED",
             "page": page,
         }
         response = self.session.get(PROJECTS_ENDPOINT, params=params, timeout=60)
@@ -189,6 +248,72 @@ class StateManager:
         self.state[str(project_id)] = last_updated
 
 
+def build_feature(details: dict[str, Any]) -> dict[str, Any] | None:
+    """Build a GeoJSON feature from project details with enriched properties."""
+    project_id = details.get("projectId")
+    aoi = details.get("areaOfInterest")
+    if not aoi:
+        return None
+
+    imagery_raw = details.get("imagery")
+    country_tag = details.get("countryTag", []) or []
+    project_info = details.get("projectInfo", {}) or {}
+
+    area_sqkm = compute_area_sqkm(aoi)
+    centroid = compute_centroid(aoi)
+
+    return {
+        "type": "Feature",
+        "geometry": aoi,
+        "properties": {
+            "projectId": project_id,
+            "name": project_info.get("name", ""),
+            "status": details.get("status"),
+            "imagery": normalize_imagery(imagery_raw),
+            "imageryRaw": imagery_raw or "",
+            "countryTag": country_tag,
+            "country": country_tag[0] if country_tag else "",
+            "organisationName": details.get("organisationName", ""),
+            "created": details.get("created"),
+            "mappingTypes": details.get("mappingTypes", []),
+            "areaSqKm": area_sqkm,
+            "centroidLon": centroid[0] if centroid else None,
+            "centroidLat": centroid[1] if centroid else None,
+            "difficulty": details.get("difficulty"),
+            "projectPriority": details.get("projectPriority"),
+            "percentMapped": details.get("percentMapped"),
+            "percentValidated": details.get("percentValidated"),
+            "lastUpdated": details.get("lastUpdated"),
+        },
+    }
+
+
+def build_summary_entry(feature: dict[str, Any]) -> dict[str, Any]:
+    """Build a lightweight summary entry from a GeoJSON feature (no geometry)."""
+    props = feature["properties"]
+    centroid = None
+    if props.get("centroidLon") is not None and props.get("centroidLat") is not None:
+        centroid = [props["centroidLon"], props["centroidLat"]]
+
+    return {
+        "id": props["projectId"],
+        "name": props.get("name", ""),
+        "status": props.get("status"),
+        "imagery": props.get("imagery"),
+        "imageryRaw": props.get("imageryRaw", ""),
+        "country": props.get("countryTag", []),
+        "org": props.get("organisationName", ""),
+        "created": (props.get("created") or "")[:10],  # Date only
+        "mappingTypes": props.get("mappingTypes", []),
+        "areaSqKm": props.get("areaSqKm"),
+        "centroid": centroid,
+        "pctMapped": props.get("percentMapped"),
+        "pctValidated": props.get("percentValidated"),
+        "difficulty": props.get("difficulty"),
+        "priority": props.get("projectPriority"),
+    }
+
+
 def generate_pmtiles(geojson_path: Path, output_path: Path) -> bool:
     """Generate PMTiles from GeoJSON using tippecanoe."""
     logger.info("Generating PMTiles with tippecanoe...")
@@ -255,13 +380,15 @@ def run_etl():
         return
 
     # Fetch and upload updated project details
-    updated_projects = []
-    for project_id, last_updated in projects_to_update:
+    updated_projects = {}  # project_id -> details
+    for i, (project_id, last_updated) in enumerate(projects_to_update, 1):
         try:
-            logger.info(f"Fetching project {project_id}...")
+            logger.info(
+                f"Fetching project {project_id}... ({i}/{len(projects_to_update)})"
+            )
             details = api_client.get_project_details(project_id)
 
-            # Upload project JSON (no .json extension, but with correct Content-Type)
+            # Upload project JSON
             s3_key = f"api/v2/projects/{project_id}"
             s3_client.put_object(
                 s3_key,
@@ -270,7 +397,7 @@ def run_etl():
             )
 
             state_manager.mark_updated(project_id, last_updated)
-            updated_projects.append(details)
+            updated_projects[project_id] = details
             logger.info(f"Uploaded project {project_id}")
 
         except requests.RequestException as e:
@@ -289,43 +416,40 @@ def run_etl():
         if project_id:
             all_project_ids.add(project_id)
 
-    # Fetch AOI from each project (use cached data where possible)
-    for project_id in all_project_ids:
+    # Build features for each project
+    for project_id in sorted(all_project_ids):
         try:
-            # Check if we just updated this project
-            updated_detail = next(
-                (p for p in updated_projects if p.get("projectId") == project_id), None
-            )
-
-            if updated_detail:
-                details = updated_detail
+            # Use just-updated data if available
+            if project_id in updated_projects:
+                details = updated_projects[project_id]
             else:
-                # Fetch from API (or could fetch from S3, but API is authoritative)
-                details = api_client.get_project_details(project_id)
+                # Try S3 cache first (much faster than API for backfill)
+                cached = s3_client.get_object(f"api/v2/projects/{project_id}")
+                if cached:
+                    details = json.loads(cached.decode("utf-8"))
+                else:
+                    # Fall back to API
+                    details = api_client.get_project_details(project_id)
 
-            aoi = details.get("areaOfInterest")
-            if aoi:
-                # Create a feature with project metadata
-                feature = {
-                    "type": "Feature",
-                    "geometry": aoi,
-                    "properties": {
-                        "projectId": project_id,
-                        "name": details.get("projectInfo", {}).get("name", ""),
-                        "status": details.get("status"),
-                        "percentMapped": details.get("percentMapped"),
-                        "percentValidated": details.get("percentValidated"),
-                        "lastUpdated": details.get("lastUpdated"),
-                    },
-                }
+            feature = build_feature(details)
+            if feature:
                 features.append(feature)
 
-        except requests.RequestException as e:
-            logger.warning(f"Could not fetch AOI for project {project_id}: {e}")
+        except (requests.RequestException, json.JSONDecodeError) as e:
+            logger.warning(f"Could not process project {project_id}: {e}")
             continue
 
     feature_collection = {"type": "FeatureCollection", "features": features}
     logger.info(f"Created FeatureCollection with {len(features)} features")
+
+    # Build projects summary JSON (no geometries, for dashboard)
+    logger.info("Building projects summary JSON...")
+    summary_projects = [build_summary_entry(f) for f in features]
+    summary = {
+        "generated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "totalProjects": len(summary_projects),
+        "projects": summary_projects,
+    }
 
     # Use temp directory for intermediate files
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -344,6 +468,14 @@ def run_etl():
             "application/geo+json",
         )
         logger.info(f"Uploaded {ALL_PROJECTS_GEOJSON}")
+
+        # Upload projects summary
+        s3_client.put_object(
+            PROJECTS_SUMMARY,
+            json.dumps(summary).encode("utf-8"),
+            "application/json",
+        )
+        logger.info(f"Uploaded {PROJECTS_SUMMARY}")
 
         # Generate and upload PMTiles
         if generate_pmtiles(geojson_path, pmtiles_path):

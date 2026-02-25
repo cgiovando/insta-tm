@@ -4,9 +4,9 @@
 Cloud-native mirror of the HOT Tasking Manager API. Fetches project data, transforms to JSON + PMTiles, uploads to S3.
 
 ## Key Files
-- `etl.py` - Main ETL script (fetch, transform, upload)
-- `requirements.txt` - Python dependencies (boto3, requests)
-- `.github/workflows/sync.yml` - Hourly GitHub Actions workflow
+- `etl.py` - Main ETL script (fetch, transform, upload, summary generation)
+- `requirements.txt` - Python dependencies (boto3, requests, shapely, pyproj)
+- `.github/workflows/sync.yml` - Daily GitHub Actions workflow (timeout: 240min for backfill)
 
 ## Architecture
 ```
@@ -33,8 +33,9 @@ All env vars above are configured as secrets in the repo.
 ```
 insta-tm/
 ├── state.json                 # Sync state (lastUpdated timestamps)
-├── all_projects.geojson       # All project boundaries
+├── all_projects.geojson       # All project boundaries (enriched properties)
 ├── projects.pmtiles           # Vector tiles (z0-12)
+├── projects_summary.json      # Lightweight summary for dashboard (no geometries)
 └── api/v2/projects/
     └── {id}                   # Individual project JSON (no extension)
 ```
@@ -45,6 +46,11 @@ insta-tm/
 - Incremental sync via `lastUpdated` comparison
 - Skip rebuild if no changes (cost optimization)
 - S3 client supports custom endpoint for future Source.coop migration
+- Includes PUBLISHED and ARCHIVED projects (~14K total)
+- Imagery values normalized to categories: Bing, Esri, Mapbox, Maxar, Custom, Other, Not specified
+- Geodesic area (sq km) computed via pyproj for each project AOI
+- GeoJSON rebuild reads cached project details from S3 (avoids re-fetching from API)
+- `projects_summary.json` generated for dashboard consumption (~2.5MB raw)
 
 ## Common Commands
 ```bash
