@@ -182,7 +182,13 @@ class HOTApiClient:
 
         while True:
             logger.info(f"Fetching projects list page {page}...")
-            data = self.get_projects_list(page)
+            try:
+                data = self.get_projects_list(page)
+            except requests.HTTPError as e:
+                # TM API returns 400 at high page numbers — treat as end
+                logger.warning(f"API returned {e.response.status_code} at page {page}, stopping pagination")
+                break
+
             results = data.get("results", [])
 
             if not results:
