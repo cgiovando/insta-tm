@@ -1,0 +1,6 @@
+.DS_Store
+.claude/
+__pycache__/
+*.py[cod]
+AGENTS.md
+PROJECT_NOTES.md
