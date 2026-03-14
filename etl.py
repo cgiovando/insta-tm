@@ -117,6 +117,22 @@ def parse_iso8601_timestamp(value: str | None) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def normalize_api_timestamp(value: str | None) -> str | None:
+    """Canonicalize HOT API timestamps so summary/detail strings compare reliably."""
+    if not value or not isinstance(value, str):
+        return None
+
+    parsed = parse_iso8601_timestamp(value)
+    if parsed is None:
+        return value
+
+    # Project detail payloads are typically millisecond precision while summary
+    # payloads can include microseconds. Truncate to milliseconds so identical
+    # update times compare equal across endpoints.
+    normalized = parsed.replace(microsecond=(parsed.microsecond // 1000) * 1000)
+    return normalized.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
 class S3Client:
     """S3 client wrapper that supports custom endpoints for S3-compatible storage."""
 
@@ -278,7 +294,11 @@ class StateManager:
                 raise ValueError("State file must decode to a JSON object")
 
             if self._is_legacy_state(payload):
-                self.project_timestamps = {str(k): v for k, v in payload.items()}
+                self.project_timestamps = {
+                    str(k): normalized
+                    for k, v in payload.items()
+                    if (normalized := normalize_api_timestamp(v)) is not None
+                }
                 self.aggregate_dirty = False
                 self.last_aggregate_build_at = None
                 self.last_full_discovery_at = None
@@ -293,7 +313,11 @@ class StateManager:
             if not isinstance(projects, dict):
                 raise ValueError("State file is missing a valid 'projects' mapping")
 
-            self.project_timestamps = {str(k): v for k, v in projects.items()}
+            self.project_timestamps = {
+                str(k): normalized
+                for k, v in projects.items()
+                if (normalized := normalize_api_timestamp(v)) is not None
+            }
             self.aggregate_dirty = bool(payload.get("aggregateDirty", False))
 
             last_aggregate_build_at = payload.get("lastAggregateBuildAt")
@@ -356,15 +380,26 @@ class StateManager:
         """Check if a project needs to be fetched based on last_updated timestamp."""
         project_key = str(project_id)
         stored_timestamp = self.project_timestamps.get(project_key)
+        normalized_last_updated = normalize_api_timestamp(last_updated)
 
         if not stored_timestamp:
             return True
 
-        return last_updated != stored_timestamp
+        return normalized_last_updated != stored_timestamp
 
     def mark_updated(self, project_id: int, last_updated: str) -> None:
         """Mark a project as updated in state."""
-        self.project_timestamps[str(project_id)] = last_updated
+        normalized_last_updated = normalize_api_timestamp(last_updated)
+        if normalized_last_updated is not None:
+            self.project_timestamps[str(project_id)] = normalized_last_updated
+
+    def remove_projects(self, project_ids: set[int]) -> int:
+        """Remove projects from sync state and return the number removed."""
+        removed = 0
+        for project_id in project_ids:
+            if self.project_timestamps.pop(str(project_id), None) is not None:
+                removed += 1
+        return removed
 
     def get_known_project_ids(self) -> set[int]:
         """Return project IDs currently tracked in sync state."""
@@ -457,7 +492,7 @@ def build_feature(details: dict[str, Any]) -> dict[str, Any] | None:
             "projectPriority": details.get("projectPriority"),
             "percentMapped": details.get("percentMapped"),
             "percentValidated": details.get("percentValidated"),
-            "lastUpdated": details.get("lastUpdated"),
+            "lastUpdated": normalize_api_timestamp(details.get("lastUpdated")),
         },
     }
 
@@ -536,7 +571,8 @@ def get_project_details_for_rebuild(
         cached_details = json.loads(cached.decode("utf-8"))
         if (
             not expected_last_updated
-            or cached_details.get("lastUpdated") == expected_last_updated
+            or normalize_api_timestamp(cached_details.get("lastUpdated"))
+            == expected_last_updated
         ):
             return cached_details
 
@@ -686,10 +722,18 @@ def run_etl():
             if isinstance(project.get("projectId"), int)
         }
         summary_last_updated = {
-            project["projectId"]: project.get("lastUpdated")
+            project["projectId"]: normalize_api_timestamp(project.get("lastUpdated"))
             for project in projects_summary
             if isinstance(project.get("projectId"), int)
         }
+        removed_from_state = state_manager.remove_projects(
+            state_manager.get_known_project_ids() - current_project_ids
+        )
+        if removed_from_state:
+            logger.info(
+                "Full discovery removed %s projects from sync state that are no longer public",
+                removed_from_state,
+            )
         feature_map = {
             project_id: feature
             for project_id, feature in feature_map.items()
@@ -712,9 +756,9 @@ def run_etl():
                 project_ids_to_refresh.add(project_id)
                 continue
 
-            feature_last_updated = (
-                cached_feature.get("properties", {}) or {}
-            ).get("lastUpdated")
+            feature_last_updated = normalize_api_timestamp(
+                (cached_feature.get("properties", {}) or {}).get("lastUpdated")
+            )
             if feature_last_updated != summary_last_updated.get(project_id):
                 project_ids_to_refresh.add(project_id)
 
@@ -737,9 +781,9 @@ def run_etl():
                 project_ids_to_refresh.add(project_id)
                 continue
 
-            feature_last_updated = (
-                cached_feature.get("properties", {}) or {}
-            ).get("lastUpdated")
+            feature_last_updated = normalize_api_timestamp(
+                (cached_feature.get("properties", {}) or {}).get("lastUpdated")
+            )
             if feature_last_updated != state_manager.project_timestamps.get(
                 str(project_id)
             ):
@@ -786,6 +830,18 @@ def run_etl():
                 feature_map.pop(project_id, None)
 
         except (requests.RequestException, json.JSONDecodeError) as e:
+            status_code = getattr(getattr(e, "response", None), "status_code", None)
+            if status_code in {403, 404}:
+                feature_map.pop(project_id, None)
+                removed = state_manager.remove_projects({project_id})
+                logger.warning(
+                    "Removing project %s from aggregate/state after %s from public API",
+                    project_id,
+                    status_code,
+                )
+                if removed:
+                    state_manager.mark_aggregate_dirty()
+                continue
             logger.warning(f"Could not process project {project_id}: {e}")
             refresh_failures += 1
             continue
