@@ -85,13 +85,14 @@ const map = new maplibregl.Map({
 
 ## How It Works
 
-1. **GitHub Actions** runs the ETL script daily (06:00 UTC)
-2. The script fetches the project list from the HOT Tasking Manager API
-3. **Incremental sync** compares `lastUpdated` timestamps against stored state
-4. Only changed projects are fetched in full and uploaded to S3
-5. If changes were detected, all project geometries are combined into a single GeoJSON file
-6. **Tippecanoe** generates PMTiles (zoom 0-12) for vector tile access
-7. If no changes are detected, the script exits early to minimize S3 PUT requests
+1. **GitHub Actions** runs the ETL script daily (06:00 UTC), and the workflow concurrency guard prevents overlapping sync runs
+2. Most daily runs query the HOT Tasking Manager API with `lastUpdatedFrom` and a 1-day safety overlap instead of crawling the full project corpus
+3. A periodic full discovery pass reconciles removals or long-missed drift without paying the full API scan cost every day
+4. Changed project uploads checkpoint the canonical `state.v3.json` state file during the run, so retries resume near the last successful upload
+5. Only changed projects are fetched in full and uploaded to S3
+6. If changes were detected, or the last aggregate rebuild did not finish, the existing aggregate GeoJSON is patched in place and only stale or missing features are rebuilt from project detail cache
+7. **Tippecanoe** generates PMTiles (zoom 0-12) for vector tile access
+8. If no changes are detected and aggregate artifacts are already current, the script exits early to minimize S3 PUT requests
 
 ## Tech Stack
 

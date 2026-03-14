@@ -10,7 +10,7 @@ Cloud-native mirror of the HOT Tasking Manager API. Fetches project data, transf
 
 ## Architecture
 ```
-HOT TM API → GitHub Actions (hourly) → S3 Bucket
+HOT TM API → GitHub Actions (daily) → S3 Bucket
                     ↓
               tippecanoe
                     ↓
@@ -32,7 +32,8 @@ All env vars above are configured as secrets in the repo.
 ## S3 Structure
 ```
 insta-tm/
-├── state.json                 # Sync state (lastUpdated timestamps)
+├── state.v3.json              # Canonical sync state (project timestamps + aggregate dirty flag)
+├── state.json                 # Legacy state fallback, read-only migration source
 ├── all_projects.geojson       # All project boundaries (enriched properties)
 ├── projects.pmtiles           # Vector tiles (z0-12)
 ├── projects_summary.json      # Lightweight summary for dashboard (no geometries)
@@ -44,12 +45,17 @@ insta-tm/
 - No `.json` extension on project files (REST-like URLs)
 - `Content-Type: application/json` set explicitly
 - Incremental sync via `lastUpdated` comparison
+- Discovery uses HOT's `lastUpdatedFrom` filter with a 1-day overlap on most runs
+- A periodic full discovery pass reconciles removals and long-missed drift without scanning the full API corpus every day
 - Skip rebuild if no changes (cost optimization)
+- State checkpoints during project uploads so failed runs do not replay the full backlog
+- Aggregate artifacts stay dirty until GeoJSON, summary, and PMTiles all finish uploading
+- GitHub Actions sync runs are serialized with a workflow concurrency group
 - S3 client supports custom endpoint for future Source.coop migration
 - Includes PUBLISHED and ARCHIVED projects (~14K total)
 - Imagery values normalized to categories: Bing, Esri, Mapbox, Maxar, Custom, Other, Not specified
 - Geodesic area (sq km) computed via pyproj for each project AOI
-- GeoJSON rebuild reads cached project details from S3 (avoids re-fetching from API)
+- GeoJSON rebuild patches cached aggregate features first, then backfills only stale or missing features from project detail cache
 - `projects_summary.json` generated for dashboard consumption (~2.5MB raw)
 
 ## Common Commands
