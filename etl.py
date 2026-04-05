@@ -6,6 +6,7 @@ Fetches project data from the HOT Tasking Manager API, transforms it into
 cloud-native formats, and uploads to S3 (or S3-compatible storage like Source.coop).
 """
 
+import gzip
 import json
 import logging
 import os
@@ -43,7 +44,7 @@ PROJECTS_SUMMARY = "projects_summary.json"
 STATE_SCHEMA_VERSION = 3
 STATE_CHECKPOINT_INTERVAL = 100
 DISCOVERY_OVERLAP_DAYS = 1
-FULL_DISCOVERY_INTERVAL_DAYS = 7
+FULL_DISCOVERY_INTERVAL_DAYS = 14
 
 # Geodesic calculator for area computation
 GEOD = Geod(ellps="WGS84")
@@ -138,8 +139,14 @@ class S3Client:
 
     def __init__(self):
         self.bucket_name = os.environ["AWS_BUCKET_NAME"]
-        self.region = os.environ.get("AWS_REGION", "us-east-1")
         endpoint_url = os.environ.get("S3_ENDPOINT_URL")
+
+        # Auto-detect Cloudflare R2 and use 'auto' region
+        if endpoint_url and "cloudflarestorage.com" in endpoint_url:
+            self.region = "auto"
+            logger.info(f"Using Cloudflare R2 endpoint: {endpoint_url}")
+        else:
+            self.region = os.environ.get("AWS_REGION", "us-east-1")
 
         # Configure boto3 client
         client_kwargs = {
@@ -150,10 +157,10 @@ class S3Client:
             "config": Config(signature_version="s3v4"),
         }
 
-        # Use custom endpoint if provided (for Source.coop or other S3-compatible storage)
         if endpoint_url:
             client_kwargs["endpoint_url"] = endpoint_url
-            logger.info(f"Using custom S3 endpoint: {endpoint_url}")
+            if "cloudflarestorage.com" not in endpoint_url:
+                logger.info(f"Using custom S3 endpoint: {endpoint_url}")
         else:
             logger.info("Using standard AWS S3")
 
@@ -163,22 +170,42 @@ class S3Client:
         """Get an object from S3, returns None if not found."""
         try:
             response = self.client.get_object(Bucket=self.bucket_name, Key=key)
-            return response["Body"].read()
+            data = response["Body"].read()
+            # Transparently decompress gzipped content
+            content_encoding = response.get("ContentEncoding", "")
+            if content_encoding == "gzip":
+                data = gzip.decompress(data)
+            return data
         except ClientError as e:
             error_code = e.response.get("Error", {}).get("Code")
             if error_code in {"404", "NoSuchKey", "NotFound"}:
                 return None
             raise
 
-    def put_object(self, key: str, body: bytes, content_type: str) -> None:
+    def put_object(
+        self,
+        key: str,
+        body: bytes,
+        content_type: str,
+        cache_control: str | None = None,
+        compress: bool = False,
+    ) -> None:
         """Upload an object to S3 with specified content type."""
-        self.client.put_object(
-            Bucket=self.bucket_name,
-            Key=key,
-            Body=body,
-            ContentType=content_type,
-        )
-        logger.debug(f"Uploaded: {key} ({content_type})")
+        kwargs: dict[str, Any] = {
+            "Bucket": self.bucket_name,
+            "Key": key,
+            "Body": body,
+            "ContentType": content_type,
+        }
+        if cache_control:
+            kwargs["CacheControl"] = cache_control
+        if compress:
+            kwargs["Body"] = gzip.compress(body)
+            kwargs["ContentEncoding"] = "gzip"
+
+        self.client.put_object(**kwargs)
+        size_kb = len(kwargs["Body"]) / 1024
+        logger.debug(f"Uploaded: {key} ({content_type}, {size_kb:.0f} KB)")
 
     def list_objects(self, prefix: str) -> list[str]:
         """List all object keys with a given prefix."""
@@ -457,6 +484,49 @@ class StateManager:
         self.last_aggregate_build_at = built_at
 
 
+def build_lean_project(details: dict[str, Any]) -> dict[str, Any]:
+    """Build a lean project JSON from the full HOT API response.
+
+    Keeps only the fields that consumers actually use, discarding HTML
+    descriptions, task geometries, team details, and other heavy fields.
+    """
+    project_info = details.get("projectInfo", {}) or {}
+    country_tag = details.get("countryTag", []) or []
+    tasks = details.get("tasks")
+    total_tasks = None
+    if isinstance(tasks, dict):
+        features = tasks.get("features")
+        if isinstance(features, list):
+            total_tasks = len(features)
+
+    lean = {
+        "projectId": details.get("projectId"),
+        "projectInfo": {
+            "name": project_info.get("name", ""),
+            "shortDescription": project_info.get("shortDescription", ""),
+        },
+        "status": details.get("status"),
+        "created": details.get("created"),
+        "lastUpdated": details.get("lastUpdated"),
+        "author": details.get("author"),
+        "organisationName": details.get("organisationName", ""),
+        "countryTag": country_tag,
+        # Raw imagery value preserved for downstream normalizers (e.g. OAM
+        # platform classification in hot-imagery-stats). The GeoJSON aggregate
+        # stores a normalized category via normalize_imagery() instead.
+        "imagery": details.get("imagery"),
+        "mappingTypes": details.get("mappingTypes", []),
+        "difficulty": details.get("difficulty"),
+        "projectPriority": details.get("projectPriority"),
+        "percentMapped": details.get("percentMapped"),
+        "percentValidated": details.get("percentValidated"),
+        "areaOfInterest": details.get("areaOfInterest"),
+        "aoiCentroid": details.get("aoiCentroid"),
+        "totalTasks": total_tasks,
+    }
+    return lean
+
+
 def build_feature(details: dict[str, Any]) -> dict[str, Any] | None:
     """Build a GeoJSON feature from project details with enriched properties."""
     project_id = details.get("projectId")
@@ -479,9 +549,7 @@ def build_feature(details: dict[str, Any]) -> dict[str, Any] | None:
             "name": project_info.get("name", ""),
             "status": details.get("status"),
             "imagery": normalize_imagery(imagery_raw),
-            "imageryRaw": imagery_raw or "",
             "countryTag": country_tag,
-            "country": country_tag[0] if country_tag else "",
             "organisationName": details.get("organisationName", ""),
             "created": details.get("created"),
             "mappingTypes": details.get("mappingTypes", []),
@@ -509,7 +577,6 @@ def build_summary_entry(feature: dict[str, Any]) -> dict[str, Any]:
         "name": props.get("name", ""),
         "status": props.get("status"),
         "imagery": props.get("imagery"),
-        "imageryRaw": props.get("imageryRaw", ""),
         "country": props.get("countryTag", []),
         "org": props.get("organisationName", ""),
         "created": (props.get("created") or "")[:10],  # Date only
@@ -585,17 +652,22 @@ def generate_pmtiles(geojson_path: Path, output_path: Path) -> bool:
 
     cmd = [
         "tippecanoe",
-        "-o",
-        str(output_path),
-        "-z",
-        "12",  # Max zoom
-        "-Z",
-        "0",  # Min zoom
-        "--force",  # Overwrite existing
+        "-o", str(output_path),
+        "-z", "12",
+        "-Z", "0",
+        "--force",
         "--no-feature-limit",
-        "--no-tile-size-limit",
-        "-l",
-        "projects",  # Layer name
+        "-l", "projects",
+        # Whitelist only the properties needed for map rendering
+        "-y", "projectId",
+        "-y", "name",
+        "-y", "status",
+        "-y", "imagery",
+        "-y", "organisationName",
+        "-y", "percentMapped",
+        "-y", "percentValidated",
+        "-y", "areaSqKm",
+        "-y", "difficulty",
         str(geojson_path),
     ]
 
@@ -670,12 +742,14 @@ def run_etl():
             )
             details = api_client.get_project_details(project_id)
 
-            # Upload project JSON
+            # Upload lean project JSON (only consumer-needed fields)
+            lean = build_lean_project(details)
             s3_key = f"api/v2/projects/{project_id}"
             s3_client.put_object(
                 s3_key,
-                json.dumps(details, indent=2).encode("utf-8"),
+                json.dumps(lean, separators=(",", ":")).encode("utf-8"),
                 "application/json",
+                cache_control="public, max-age=3600",
             )
 
             state_manager.mark_updated(project_id, last_updated)
@@ -868,27 +942,32 @@ def run_etl():
         geojson_path = tmpdir_path / ALL_PROJECTS_GEOJSON
         pmtiles_path = tmpdir_path / PMTILES_OUTPUT
 
-        # Write GeoJSON
-        with open(geojson_path, "w") as f:
-            json.dump(feature_collection, f)
+        # Serialize once, write to disk for tippecanoe, upload compressed to S3
+        geojson_bytes = json.dumps(feature_collection, separators=(",", ":")).encode("utf-8")
+        with open(geojson_path, "wb") as f:
+            f.write(geojson_bytes)
 
-        # Upload GeoJSON
         s3_client.put_object(
             ALL_PROJECTS_GEOJSON,
-            json.dumps(feature_collection).encode("utf-8"),
+            geojson_bytes,
             "application/geo+json",
+            cache_control="public, max-age=3600",
+            compress=True,
         )
-        logger.info(f"Uploaded {ALL_PROJECTS_GEOJSON}")
+        logger.info(f"Uploaded {ALL_PROJECTS_GEOJSON} ({len(geojson_bytes) / 1024 / 1024:.1f} MB raw)")
 
-        # Upload projects summary
+        # Upload projects summary (compressed)
+        summary_bytes = json.dumps(summary, separators=(",", ":")).encode("utf-8")
         s3_client.put_object(
             PROJECTS_SUMMARY,
-            json.dumps(summary).encode("utf-8"),
+            summary_bytes,
             "application/json",
+            cache_control="public, max-age=3600",
+            compress=True,
         )
         logger.info(f"Uploaded {PROJECTS_SUMMARY}")
 
-        # Generate and upload PMTiles
+        # Generate and upload PMTiles (no gzip - PMTiles uses internal compression)
         if generate_pmtiles(geojson_path, pmtiles_path):
             with open(pmtiles_path, "rb") as f:
                 pmtiles_data = f.read()
@@ -897,8 +976,9 @@ def run_etl():
                 PMTILES_OUTPUT,
                 pmtiles_data,
                 "application/vnd.pmtiles",
+                cache_control="public, max-age=3600",
             )
-            logger.info(f"Uploaded {PMTILES_OUTPUT}")
+            logger.info(f"Uploaded {PMTILES_OUTPUT} ({len(pmtiles_data) / 1024 / 1024:.1f} MB)")
             if refresh_failures == 0 and failed_project_updates == 0:
                 aggregate_success = True
             else:

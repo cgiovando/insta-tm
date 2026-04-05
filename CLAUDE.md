@@ -1,7 +1,7 @@
 # CLAUDE.md - Insta-TM Project Guide
 
 ## Project Summary
-Cloud-native mirror of the HOT Tasking Manager API. Fetches project data, transforms to JSON + PMTiles, uploads to S3.
+Cloud-native mirror of the HOT Tasking Manager API. Fetches project data, transforms to lean JSON + compressed GeoJSON + PMTiles, uploads to S3-compatible storage (AWS S3 or Cloudflare R2).
 
 ## Key Files
 - `etl.py` - Main ETL script (fetch, transform, upload, summary generation)
@@ -10,53 +10,54 @@ Cloud-native mirror of the HOT Tasking Manager API. Fetches project data, transf
 
 ## Architecture
 ```
-HOT TM API → GitHub Actions (daily) → S3 Bucket
-                    ↓
-              tippecanoe
-                    ↓
-              PMTiles
+HOT TM API --> GitHub Actions (daily) --> S3-compatible storage (R2 or S3)
+                    |                            |
+              tippecanoe                   CDN (Cloudflare)
+                    |                            |
+              PMTiles                      Public consumers
 ```
 
 ## Environment Variables
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `AWS_ACCESS_KEY_ID` | Yes | AWS credentials |
-| `AWS_SECRET_ACCESS_KEY` | Yes | AWS credentials |
+| `AWS_ACCESS_KEY_ID` | Yes | S3-compatible credentials |
+| `AWS_SECRET_ACCESS_KEY` | Yes | S3-compatible credentials |
 | `AWS_BUCKET_NAME` | Yes | Target bucket (`insta-tm`) |
-| `AWS_REGION` | Yes | AWS region (`us-east-1`) |
-| `S3_ENDPOINT_URL` | No | Custom endpoint for Source.coop |
+| `AWS_REGION` | Yes | AWS region (auto-detected as `auto` for R2) |
+| `S3_ENDPOINT_URL` | No | Custom endpoint for R2 or other S3-compatible storage |
 
 ## GitHub Secrets
 All env vars above are configured as secrets in the repo.
 
-## S3 Structure
+## Storage Structure
 ```
 insta-tm/
 ├── state.v3.json              # Canonical sync state (project timestamps + aggregate dirty flag)
-├── state.json                 # Legacy state fallback, read-only migration source
-├── all_projects.geojson       # All project boundaries (enriched properties)
-├── projects.pmtiles           # Vector tiles (z0-12)
-├── projects_summary.json      # Lightweight summary for dashboard (no geometries)
+├── all_projects.geojson       # All project boundaries, gzip compressed (Content-Encoding: gzip)
+├── projects.pmtiles           # Vector tiles (z0-12), curated properties only
+├── projects_summary.json      # Lightweight summary for dashboard, gzip compressed
 └── api/v2/projects/
-    └── {id}                   # Individual project JSON (no extension)
+    └── {id}                   # Lean project JSON (curated fields only, no extension)
 ```
 
 ## Key Design Decisions
-- No `.json` extension on project files (REST-like URLs)
-- `Content-Type: application/json` set explicitly
-- Incremental sync via `lastUpdated` comparison
-- Discovery uses HOT's `lastUpdatedFrom` filter with a 1-day overlap on most runs
-- A periodic full discovery pass reconciles removals and long-missed drift without scanning the full API corpus every day
+- Individual project files store only consumer-needed fields (not full API responses)
+- `totalTasks` stored as scalar instead of full task geometry array
+- GeoJSON and summary uploaded with gzip `Content-Encoding` for smaller transfers
+- PMTiles NOT gzipped (has internal compression, relies on HTTP range requests)
+- Tippecanoe uses `-y` property whitelist for lean tiles (no `--no-feature-limit`/`--no-tile-size-limit`)
+- All public objects include `Cache-Control: public, max-age=3600`
+- JSON minified with `separators=(",", ":")` instead of `indent=2`
+- R2 auto-detected from `S3_ENDPOINT_URL` containing `cloudflarestorage.com`
+- Incremental sync via `lastUpdated` comparison with 1-day overlap
+- Full discovery every 14 days to reconcile removals and drift
 - Skip rebuild if no changes (cost optimization)
-- State checkpoints during project uploads so failed runs do not replay the full backlog
+- State checkpoints during project uploads so failed runs resume near the last successful upload
 - Aggregate artifacts stay dirty until GeoJSON, summary, and PMTiles all finish uploading
-- GitHub Actions sync runs are serialized with a workflow concurrency group
-- S3 client supports custom endpoint for future Source.coop migration
-- Includes PUBLISHED and ARCHIVED projects (~14K total)
-- Imagery values normalized to categories: Bing, Esri, Mapbox, Maxar, Custom, Other, Not specified
-- Geodesic area (sq km) computed via pyproj for each project AOI
-- GeoJSON rebuild patches cached aggregate features first, then backfills only stale or missing features from project detail cache
-- `projects_summary.json` generated for dashboard consumption (~2.5MB raw)
+
+## Dependent Projects
+- `cgiovando/hot-imagery-stats` - reads `api/v2/projects/` via boto3
+- `cgiovando/osm-carbon-date` - reads GeoJSON, PMTiles, and individual project JSONs via HTTP
 
 ## Common Commands
 ```bash
@@ -66,13 +67,7 @@ python etl.py
 # Trigger workflow manually
 gh workflow run sync.yml --repo cgiovando/insta-tm
 
-# Check S3 contents
-aws s3 ls s3://insta-tm/ --recursive --human-readable
-
 # View workflow logs
 gh run list --repo cgiovando/insta-tm
 gh run view <run-id> --repo cgiovando/insta-tm --log
 ```
-
-## Pending: Source.coop Migration
-See MEMORY.md for details on IAM Role + OIDC setup needed.
