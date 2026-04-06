@@ -705,9 +705,9 @@ def run_etl():
             "Running full discovery to reconcile the full public project corpus"
         )
         projects_summary = api_client.get_projects_summary()
-        # NOTE: full discovery is NOT marked complete here. It is deferred
-        # until the aggregate rebuild succeeds so that a crashed run retries
-        # the full discovery instead of silently losing unprocessed projects.
+        # NOTE: full discovery is marked complete after the removal prune,
+        # so removals and the discovery marker are persisted together. This
+        # prevents a failed aggregate rebuild from resurrecting removed projects.
     else:
         logger.info(
             "Running incremental discovery from %s with %s-day overlap",
@@ -780,14 +780,6 @@ def run_etl():
             "Checkpointed state after %s project uploads", successful_uploads
         )
 
-    # Mark full discovery complete after uploads finish. This is separate from
-    # aggregate_dirty (which tracks GeoJSON/PMTiles rebuild) so that a failed
-    # aggregate rebuild doesn't force re-fetching the entire API corpus.
-    if full_discovery and failed_project_updates == 0:
-        state_manager.mark_full_discovery(run_started_at_str)
-        state_manager.save()
-        logger.info("Full discovery marked complete after all uploads succeeded")
-
     # Build master GeoJSON from all projects
     logger.info("Building master GeoJSON FeatureCollection...")
 
@@ -829,6 +821,15 @@ def run_etl():
                 "Full discovery removed %s cached projects no longer present in the public corpus",
                 removed_projects,
             )
+
+        # Mark full discovery complete and persist removals together, so a
+        # failed aggregate rebuild doesn't resurrect removed projects on the
+        # next incremental run. This is separate from aggregate_dirty (which
+        # tracks GeoJSON/PMTiles rebuild independently).
+        if failed_project_updates == 0:
+            state_manager.mark_full_discovery(run_started_at_str)
+            state_manager.save()
+            logger.info("Full discovery marked complete (removals + discovery persisted)")
 
         project_ids_to_refresh = set(updated_projects)
         for project_id in current_project_ids:
