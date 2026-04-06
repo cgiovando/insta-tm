@@ -233,59 +233,43 @@ class HOTApiClient:
             }
         )
 
-    def get_projects_list(
+    def _paginate_projects(
         self,
-        page: int = 1,
         last_updated_from: str | None = None,
+        last_updated_to: str | None = None,
         order_by: str = "last_updated",
-    ) -> dict[str, Any]:
-        """Fetch a page of projects from the API."""
-        params = {
-            "orderBy": order_by,
-            "orderByType": "DESC",
-            "projectStatuses": "PUBLISHED,ARCHIVED",
-            "omitMapResults": "true",
-            "page": page,
-        }
-        if last_updated_from:
-            params["lastUpdatedFrom"] = last_updated_from
-        response = self.session.get(PROJECTS_ENDPOINT, params=params, timeout=60)
-        response.raise_for_status()
-        return response.json()
-
-    def get_projects_summary(
-        self, last_updated_from: str | None = None
     ) -> list[dict[str, Any]]:
-        """Fetch project summary pages, optionally filtered by last-updated date.
-
-        Full discovery (no date filter) uses orderBy=id to avoid the TM API's
-        400 error at high page numbers when ordering by last_updated.
-        Incremental discovery keeps orderBy=last_updated for efficiency.
-        """
+        """Paginate through project list pages with the given filters."""
         all_projects = []
         page = 1
-        # The TM API returns 400 at ~page 940 when ordering by last_updated.
-        # Full discovery uses orderBy=id which paginates cleanly past 1000 pages.
-        order_by = "last_updated" if last_updated_from else "id"
-        mode = (
-            f"incremental discovery from {last_updated_from}"
-            if last_updated_from
-            else "full discovery"
-        )
-        logger.info("Starting %s (orderBy=%s)", mode, order_by)
-
         while True:
-            logger.info(f"Fetching projects list page {page}...")
+            params = {
+                "orderBy": order_by,
+                "orderByType": "DESC",
+                "projectStatuses": "PUBLISHED,ARCHIVED",
+                "omitMapResults": "true",
+                "page": page,
+            }
+            if last_updated_from:
+                params["lastUpdatedFrom"] = last_updated_from
+            if last_updated_to:
+                params["lastUpdatedTo"] = last_updated_to
+
             try:
-                data = self.get_projects_list(
-                    page, last_updated_from=last_updated_from, order_by=order_by
+                response = self.session.get(
+                    PROJECTS_ENDPOINT, params=params, timeout=60
                 )
+                response.raise_for_status()
+                data = response.json()
             except requests.HTTPError as e:
-                logger.warning(f"API returned {e.response.status_code} at page {page}, stopping pagination")
+                logger.warning(
+                    "API returned %s at page %s, stopping pagination",
+                    e.response.status_code,
+                    page,
+                )
                 break
 
             results = data.get("results", [])
-
             if not results:
                 break
 
@@ -297,7 +281,56 @@ class HOTApiClient:
 
             page += 1
 
-        logger.info(f"Found {len(all_projects)} projects total")
+        return all_projects
+
+    def get_projects_summary(
+        self, last_updated_from: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Fetch project summary pages, optionally filtered by last-updated date.
+
+        Incremental discovery uses a single paginated query filtered by date.
+        Full discovery queries year-by-year to work around the TM API's ~page
+        870-940 pagination limit that prevents reaching all projects in a
+        single query regardless of sort order.
+        """
+        if last_updated_from:
+            logger.info("Starting incremental discovery from %s", last_updated_from)
+            projects = self._paginate_projects(last_updated_from=last_updated_from)
+            logger.info("Found %s projects in incremental discovery", len(projects))
+            return projects
+
+        # Full discovery: query year-by-year to stay under the API page limit.
+        # Each year has <2K projects (~140 pages max), well under the limit.
+        logger.info("Starting full discovery (year-by-year)")
+        all_projects = []
+        seen_ids: set[int] = set()
+
+        from datetime import datetime, timezone
+        current_year = datetime.now(timezone.utc).year
+        for year in range(2012, current_year + 1):
+            year_from = f"{year}-01-01"
+            year_to = f"{year}-12-31"
+            year_projects = self._paginate_projects(
+                last_updated_from=year_from,
+                last_updated_to=year_to,
+                order_by="last_updated",
+            )
+            new_count = 0
+            for p in year_projects:
+                pid = p.get("projectId")
+                if pid and pid not in seen_ids:
+                    seen_ids.add(pid)
+                    all_projects.append(p)
+                    new_count += 1
+            logger.info(
+                "Full discovery %d: %d projects (%d new, %d total)",
+                year,
+                len(year_projects),
+                new_count,
+                len(all_projects),
+            )
+
+        logger.info("Full discovery complete: %d projects total", len(all_projects))
         return all_projects
 
     def get_project_details(self, project_id: int) -> dict[str, Any]:
