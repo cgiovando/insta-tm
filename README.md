@@ -57,19 +57,19 @@ Each individual project file contains a curated subset of the HOT API response -
 ### Fetch a single project
 
 ```bash
-curl https://insta-tm.s3.us-east-1.amazonaws.com/api/v2/projects/17823
+curl https://pub-9f93f222eb8648a08829b4d1cd8edcfb.r2.dev/api/v2/projects/17823
 ```
 
 ### Get project name with jq
 
 ```bash
-curl -s https://insta-tm.s3.us-east-1.amazonaws.com/api/v2/projects/17823 | jq '.projectInfo.name'
+curl -s https://pub-9f93f222eb8648a08829b4d1cd8edcfb.r2.dev/api/v2/projects/17823 | jq '.projectInfo.name'
 ```
 
 ### Get project status and progress
 
 ```bash
-curl -s https://insta-tm.s3.us-east-1.amazonaws.com/api/v2/projects/17823 | jq '{
+curl -s https://pub-9f93f222eb8648a08829b4d1cd8edcfb.r2.dev/api/v2/projects/17823 | jq '{
   status: .status,
   percentMapped: .percentMapped,
   percentValidated: .percentValidated,
@@ -82,7 +82,7 @@ curl -s https://insta-tm.s3.us-east-1.amazonaws.com/api/v2/projects/17823 | jq '
 The GeoJSON and summary files are served with gzip compression. Use `--compressed` so curl decompresses automatically:
 
 ```bash
-curl --compressed -O https://insta-tm.s3.us-east-1.amazonaws.com/all_projects.geojson
+curl --compressed -O https://pub-9f93f222eb8648a08829b4d1cd8edcfb.r2.dev/all_projects.geojson
 ```
 
 ### Use PMTiles in MapLibre GL JS
@@ -101,7 +101,7 @@ const map = new maplibregl.Map({
     sources: {
       projects: {
         type: 'vector',
-        url: 'pmtiles://https://insta-tm.s3.us-east-1.amazonaws.com/projects.pmtiles'
+        url: 'pmtiles://https://pub-9f93f222eb8648a08829b4d1cd8edcfb.r2.dev/projects.pmtiles'
       }
     },
     layers: [{
