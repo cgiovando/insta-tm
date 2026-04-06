@@ -154,7 +154,11 @@ class S3Client:
             "region_name": self.region,
             "aws_access_key_id": os.environ["AWS_ACCESS_KEY_ID"],
             "aws_secret_access_key": os.environ["AWS_SECRET_ACCESS_KEY"],
-            "config": Config(signature_version="s3v4"),
+            "config": Config(
+                signature_version="s3v4",
+                request_checksum_calculation="when_required",
+                response_checksum_validation="when_required",
+            ),
         }
 
         if endpoint_url:
