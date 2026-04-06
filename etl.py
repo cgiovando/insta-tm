@@ -55,7 +55,7 @@ IMAGERY_PATTERNS = [
     (re.compile(r"esri|arcgis|world.imagery", re.IGNORECASE), "Esri"),
     (re.compile(r"mapbox", re.IGNORECASE), "Mapbox"),
     (re.compile(r"maxar|digitalglobe|vivid|securewatch", re.IGNORECASE), "Maxar"),
-    (re.compile(r"openaerialmap|oam|open.aerial", re.IGNORECASE), "Custom"),
+    (re.compile(r"openaerialmap|oam|open\.aerial", re.IGNORECASE), "OAM"),
     (re.compile(r"custom", re.IGNORECASE), "Custom"),
 ]
 
@@ -705,7 +705,9 @@ def run_etl():
             "Running full discovery to reconcile the full public project corpus"
         )
         projects_summary = api_client.get_projects_summary()
-        state_manager.mark_full_discovery(run_started_at_str)
+        # NOTE: full discovery is NOT marked complete here. It is deferred
+        # until the aggregate rebuild succeeds so that a crashed run retries
+        # the full discovery instead of silently losing unprocessed projects.
     else:
         logger.info(
             "Running incremental discovery from %s with %s-day overlap",
@@ -871,6 +873,7 @@ def run_etl():
 
     if not projects_to_update and not aggregate_rebuild_required:
         if full_discovery:
+            state_manager.mark_full_discovery(run_started_at_str)
             state_manager.save()
         logger.info("No changes detected, skipping uploads")
         logger.info("ETL complete!")
@@ -991,6 +994,8 @@ def run_etl():
             logger.warning("PMTiles generation failed, skipping upload")
 
     if aggregate_success:
+        if full_discovery:
+            state_manager.mark_full_discovery(run_started_at_str)
         state_manager.mark_aggregate_clean(generated_at)
         state_manager.save()
     else:
