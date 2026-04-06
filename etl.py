@@ -234,11 +234,14 @@ class HOTApiClient:
         )
 
     def get_projects_list(
-        self, page: int = 1, last_updated_from: str | None = None
+        self,
+        page: int = 1,
+        last_updated_from: str | None = None,
+        order_by: str = "last_updated",
     ) -> dict[str, Any]:
         """Fetch a page of projects from the API."""
         params = {
-            "orderBy": "last_updated",
+            "orderBy": order_by,
             "orderByType": "DESC",
             "projectStatuses": "PUBLISHED,ARCHIVED",
             "omitMapResults": "true",
@@ -253,22 +256,31 @@ class HOTApiClient:
     def get_projects_summary(
         self, last_updated_from: str | None = None
     ) -> list[dict[str, Any]]:
-        """Fetch project summary pages, optionally filtered by last-updated date."""
+        """Fetch project summary pages, optionally filtered by last-updated date.
+
+        Full discovery (no date filter) uses orderBy=id to avoid the TM API's
+        400 error at high page numbers when ordering by last_updated.
+        Incremental discovery keeps orderBy=last_updated for efficiency.
+        """
         all_projects = []
         page = 1
+        # The TM API returns 400 at ~page 940 when ordering by last_updated.
+        # Full discovery uses orderBy=id which paginates cleanly past 1000 pages.
+        order_by = "last_updated" if last_updated_from else "id"
         mode = (
             f"incremental discovery from {last_updated_from}"
             if last_updated_from
             else "full discovery"
         )
-        logger.info("Starting %s", mode)
+        logger.info("Starting %s (orderBy=%s)", mode, order_by)
 
         while True:
             logger.info(f"Fetching projects list page {page}...")
             try:
-                data = self.get_projects_list(page, last_updated_from=last_updated_from)
+                data = self.get_projects_list(
+                    page, last_updated_from=last_updated_from, order_by=order_by
+                )
             except requests.HTTPError as e:
-                # TM API returns 400 at high page numbers — treat as end
                 logger.warning(f"API returned {e.response.status_code} at page {page}, stopping pagination")
                 break
 
