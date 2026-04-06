@@ -242,6 +242,7 @@ class HOTApiClient:
         """Paginate through project list pages with the given filters."""
         all_projects = []
         page = 1
+        total_pages = None
         while True:
             params = {
                 "orderBy": order_by,
@@ -262,12 +263,23 @@ class HOTApiClient:
                 response.raise_for_status()
                 data = response.json()
             except requests.HTTPError as e:
-                logger.warning(
-                    "API returned %s at page %s, stopping pagination",
-                    e.response.status_code,
-                    page,
-                )
-                break
+                status_code = e.response.status_code
+                if status_code == 400:
+                    logger.warning(
+                        "API returned 400 at page %s (likely bad data on page). Skipping page.",
+                        page,
+                    )
+                    if total_pages is not None and page >= total_pages:
+                        break
+                    page += 1
+                    continue
+                else:
+                    logger.warning(
+                        "API returned %s at page %s, stopping pagination",
+                        status_code,
+                        page,
+                    )
+                    break
 
             results = data.get("results", [])
             if not results:
@@ -275,8 +287,9 @@ class HOTApiClient:
 
             all_projects.extend(results)
             pagination = data.get("pagination", {})
+            total_pages = pagination.get("pages", 1)
 
-            if page >= pagination.get("pages", 1):
+            if page >= total_pages:
                 break
 
             page += 1
@@ -310,13 +323,23 @@ class HOTApiClient:
         for year in range(2012, current_year + 1):
             year_from = f"{year}-01-01"
             year_to = f"{year}-12-31"
-            year_projects = self._paginate_projects(
+            
+            # First pass: sort by last_updated
+            year_projects_1 = self._paginate_projects(
                 last_updated_from=year_from,
                 last_updated_to=year_to,
                 order_by="last_updated",
             )
+            
+            # Second pass: sort by id (rescues valid projects stuck on broken pages in the first pass)
+            year_projects_2 = self._paginate_projects(
+                last_updated_from=year_from,
+                last_updated_to=year_to,
+                order_by="id",
+            )
+            
             new_count = 0
-            for p in year_projects:
+            for p in year_projects_1 + year_projects_2:
                 pid = p.get("projectId")
                 if pid and pid not in seen_ids:
                     seen_ids.add(pid)
@@ -325,7 +348,7 @@ class HOTApiClient:
             logger.info(
                 "Full discovery %d: %d projects (%d new, %d total)",
                 year,
-                len(year_projects),
+                len(year_projects_1) + len(year_projects_2),
                 new_count,
                 len(all_projects),
             )
