@@ -824,8 +824,11 @@ def run_etl():
 
         # Mark full discovery complete and persist removals together, so a
         # failed aggregate rebuild doesn't resurrect removed projects on the
-        # next incremental run. This is separate from aggregate_dirty (which
-        # tracks GeoJSON/PMTiles rebuild independently).
+        # next incremental run. Also mark aggregate dirty when projects were
+        # removed, so the cached aggregate is rebuilt even if the current run
+        # fails during the rebuild phase.
+        if removed_from_state or removed_projects:
+            state_manager.mark_aggregate_dirty()
         if failed_project_updates == 0:
             state_manager.mark_full_discovery(run_started_at_str)
             state_manager.save()
