@@ -55,7 +55,7 @@ IMAGERY_PATTERNS = [
     (re.compile(r"esri|arcgis|world.imagery", re.IGNORECASE), "Esri"),
     (re.compile(r"mapbox", re.IGNORECASE), "Mapbox"),
     (re.compile(r"maxar|digitalglobe|vivid|securewatch", re.IGNORECASE), "Maxar"),
-    (re.compile(r"openaerialmap|oam|open\.aerial", re.IGNORECASE), "OAM"),
+    (re.compile(r"openaerialmap|oam|open[\s._-]*aerial", re.IGNORECASE), "OAM"),
     (re.compile(r"custom", re.IGNORECASE), "Custom"),
 ]
 
@@ -780,6 +780,14 @@ def run_etl():
             "Checkpointed state after %s project uploads", successful_uploads
         )
 
+    # Mark full discovery complete after uploads finish. This is separate from
+    # aggregate_dirty (which tracks GeoJSON/PMTiles rebuild) so that a failed
+    # aggregate rebuild doesn't force re-fetching the entire API corpus.
+    if full_discovery and failed_project_updates == 0:
+        state_manager.mark_full_discovery(run_started_at_str)
+        state_manager.save()
+        logger.info("Full discovery marked complete after all uploads succeeded")
+
     # Build master GeoJSON from all projects
     logger.info("Building master GeoJSON FeatureCollection...")
 
@@ -994,8 +1002,6 @@ def run_etl():
             logger.warning("PMTiles generation failed, skipping upload")
 
     if aggregate_success:
-        if full_discovery:
-            state_manager.mark_full_discovery(run_started_at_str)
         state_manager.mark_aggregate_clean(generated_at)
         state_manager.save()
     else:
