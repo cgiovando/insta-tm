@@ -4,3 +4,6 @@ __pycache__/
 *.py[cod]
 AGENTS.md
 PROJECT_NOTES.md
+
+.timesheet-log.md
+CLAUDE.md
