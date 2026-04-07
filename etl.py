@@ -211,6 +211,24 @@ class S3Client:
         size_kb = len(kwargs["Body"]) / 1024
         logger.debug(f"Uploaded: {key} ({content_type}, {size_kb:.0f} KB)")
 
+    def delete_objects(self, keys: list[str]) -> int:
+        """Delete objects from R2/S3. Returns the number successfully deleted."""
+        if not keys:
+            return 0
+        deleted = 0
+        # R2/S3 DeleteObjects supports up to 1000 keys per request
+        for i in range(0, len(keys), 1000):
+            batch = keys[i : i + 1000]
+            response = self.client.delete_objects(
+                Bucket=self.bucket_name,
+                Delete={"Objects": [{"Key": k} for k in batch], "Quiet": True},
+            )
+            errors = response.get("Errors", [])
+            deleted += len(batch) - len(errors)
+            for err in errors:
+                logger.warning("Failed to delete %s: %s", err["Key"], err["Message"])
+        return deleted
+
     def list_objects(self, prefix: str) -> list[str]:
         """List all object keys with a given prefix."""
         keys = []
@@ -874,14 +892,17 @@ def run_etl():
             for project in projects_summary
             if isinstance(project.get("projectId"), int)
         }
-        removed_from_state = state_manager.remove_projects(
-            state_manager.get_known_project_ids() - current_project_ids
-        )
+        ids_to_remove = state_manager.get_known_project_ids() - current_project_ids
+        removed_from_state = state_manager.remove_projects(ids_to_remove)
         if removed_from_state:
             logger.info(
                 "Full discovery removed %s projects from sync state that are no longer public",
                 removed_from_state,
             )
+            # Delete orphan project files from R2
+            keys_to_delete = [f"api/v2/projects/{pid}" for pid in ids_to_remove]
+            deleted = s3_client.delete_objects(keys_to_delete)
+            logger.info("Deleted %s orphan project files from R2", deleted)
         feature_map = {
             project_id: feature
             for project_id, feature in feature_map.items()
@@ -1001,6 +1022,7 @@ def run_etl():
                     status_code,
                 )
                 if removed:
+                    s3_client.delete_objects([f"api/v2/projects/{project_id}"])
                     state_manager.mark_aggregate_dirty()
                 continue
             logger.warning(f"Could not process project {project_id}: {e}")
