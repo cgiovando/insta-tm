@@ -670,6 +670,7 @@ def build_summary_entry(feature: dict[str, Any]) -> dict[str, Any]:
         "country": props.get("countryTag", []),
         "org": props.get("organisationName", ""),
         "created": (props.get("created") or "")[:10],  # Date only
+        "lastUpdated": props.get("lastUpdated"),  # Full ISO timestamp
         "mappingTypes": props.get("mappingTypes", []),
         "areaSqKm": props.get("areaSqKm"),
         "centroid": centroid,
