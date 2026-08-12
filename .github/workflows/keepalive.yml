@@ -1,0 +1,62 @@
+name: Keepalive
+
+# Why this exists
+#
+# GitHub automatically disables scheduled workflows in public repositories
+# after 60 days of repository inactivity. This repo's data workflows write
+# their output to object storage and never push back here, so nothing resets
+# that clock and the schedules get silently switched off. That is what
+# happened on 2026-07-31.
+#
+# This job makes a trivial timestamp commit twice a month. That counts as
+# repository activity and keeps every scheduled workflow in this repo enabled,
+# including this one. Pushes made with GITHUB_TOKEN do not trigger workflow
+# runs, so this cannot loop.
+#
+# It touches nothing else. Deleting this file is safe; the only consequence is
+# that the scheduled workflows here go back to expiring every 60 days.
+
+on:
+  schedule:
+    # 1st and 15th of each month at 05:00 UTC. Max gap is ~16 days, well
+    # inside the 60-day window, so several consecutive failures are survivable.
+    - cron: "0 5 1,15 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Update keepalive stamp and push
+        run: |
+          set -euo pipefail
+
+          {
+            echo "Last keepalive: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo
+            echo "Written by .github/workflows/keepalive.yml."
+            echo "Its only purpose is to create repository activity so GitHub does not"
+            echo "auto-disable this repository's scheduled workflows after 60 days."
+            echo "Nothing reads this file."
+          } > .github/keepalive.txt
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/keepalive.txt
+
+          if git diff --staged --quiet; then
+            echo "No change to commit; nothing to do."
+            exit 0
+          fi
+
+          git commit -m "chore: keepalive $(date -u +%Y-%m-%d)"
+          git push
