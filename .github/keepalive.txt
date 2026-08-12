@@ -1,0 +1,6 @@
+Last keepalive: 2026-08-12T16:15:09Z
+
+Written by .github/workflows/keepalive.yml.
+Its only purpose is to create repository activity so GitHub does not
+auto-disable this repository's scheduled workflows after 60 days.
+Nothing reads this file.
