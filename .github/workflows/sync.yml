@@ -55,6 +55,6 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_BUCKET_NAME: ${{ secrets.AWS_BUCKET_NAME }}
           AWS_REGION: ${{ secrets.AWS_REGION }}
-          # Optional: For S3-compatible storage like Source.coop
+          # Optional: endpoint for S3-compatible storage such as Cloudflare R2
           S3_ENDPOINT_URL: ${{ secrets.S3_ENDPOINT_URL }}
         run: python etl.py

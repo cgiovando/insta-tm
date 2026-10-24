@@ -159,7 +159,25 @@ export S3_ENDPOINT_URL=https://your-endpoint.com
 
 # Run ETL
 python etl.py
+
+# Run tests
+python -m unittest discover -s tests
 ```
+
+## Hosting Your Own Copy
+
+The ETL writes to any S3-compatible bucket. The public instance uses Cloudflare R2 because egress is free, which matters for the large GeoJSON download.
+
+1. Create a bucket and enable public read access (on R2, a custom domain or the `r2.dev` subdomain).
+2. Allow cross-origin reads so browser apps can fetch the files, for example on R2:
+   ```json
+   [{"AllowedOrigins": ["*"], "AllowedMethods": ["GET", "HEAD"], "AllowedHeaders": ["*"], "MaxAgeSeconds": 86400}]
+   ```
+3. Create an access key with object read and write permission on that bucket.
+4. Set the variables in the Configuration table below as GitHub Actions secrets. For R2, `S3_ENDPOINT_URL` is `https://<account_id>.r2.cloudflarestorage.com` and the region is detected automatically.
+5. Run the workflow once (`gh workflow run sync.yml`). The first run has no state, so it fetches every project and takes much longer than the daily runs.
+
+Switching storage later only needs new secrets and a seed run; the code is the same for S3 and R2.
 
 ## Configuration
 

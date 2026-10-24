@@ -3,7 +3,7 @@
 HOT Tasking Manager Cloud Native Mirror ETL Script
 
 Fetches project data from the HOT Tasking Manager API, transforms it into
-cloud-native formats, and uploads to S3 (or S3-compatible storage like Source.coop).
+cloud-native formats, and uploads to S3-compatible storage (AWS S3 or Cloudflare R2).
 """
 
 import gzip
