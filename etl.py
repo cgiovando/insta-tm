@@ -373,8 +373,10 @@ class HOTApiClient:
 
         current_year = datetime.now(timezone.utc).year
         for year in range(2012, current_year + 1):
+            # lastUpdatedTo is exclusive (midnight at the start of that day),
+            # so end the window on 1 January of the next year to keep 31 December.
             year_from = f"{year}-01-01"
-            year_to = f"{year}-12-31"
+            year_to = f"{year + 1}-01-01"
 
             year_projects, skipped_pages = self._paginate_projects(
                 last_updated_from=year_from,

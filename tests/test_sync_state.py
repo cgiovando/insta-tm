@@ -161,6 +161,18 @@ class PaginationTests(unittest.TestCase):
         self.assertEqual(sorted(p["projectId"] for p in projects), [1, 2])
         self.assertEqual([c for c in calls if c[1] == "id"], [("2020", "id")])
 
+    def test_year_windows_include_31_december(self):
+        windows = []
+
+        def fake_paginate(last_updated_from=None, last_updated_to=None, order_by="last_updated"):
+            windows.append((last_updated_from, last_updated_to))
+            return [], 0
+
+        with mock.patch.object(self.client, "_paginate_projects", side_effect=fake_paginate):
+            self.client.get_projects_summary()
+
+        self.assertIn(("2023-01-01", "2024-01-01"), windows)
+
 
 class RunEtlTests(unittest.TestCase):
     def test_broken_project_does_not_block_discovery_or_aggregate(self):
