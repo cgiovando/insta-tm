@@ -22,6 +22,8 @@ import boto3
 import requests
 from botocore.config import Config
 from botocore.exceptions import ClientError
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from pyproj import Geod
 from shapely.geometry import shape
 
@@ -45,6 +47,18 @@ STATE_SCHEMA_VERSION = 3
 STATE_CHECKPOINT_INTERVAL = 100
 DISCOVERY_OVERLAP_DAYS = 1
 FULL_DISCOVERY_INTERVAL_DAYS = 14
+# Stop paginating if this many pages in a row return 400 (guards against an
+# endless loop when the first page fails and total_pages is never known).
+MAX_CONSECUTIVE_BAD_PAGES = 10
+# A full discovery that would remove more than this many projects is treated as
+# a broken API response rather than real removals.
+MAX_REMOVALS_PER_DISCOVERY = 200
+# The run fails (so GitHub notifies) when the mirror falls this far behind.
+MAX_AGGREGATE_STALENESS_DAYS = 3
+
+
+class DiscoveryError(RuntimeError):
+    """Project discovery could not page through the API completely."""
 
 # Geodesic calculator for area computation
 GEOD = Geod(ellps="WGS84")
@@ -250,17 +264,35 @@ class HOTApiClient:
                 "User-Agent": "HOT-TM-CloudNativeMirror/1.0",
             }
         )
+        # Retry transient failures with backoff. raise_on_status=False hands the
+        # final response back so raise_for_status() still reports the real code.
+        retry = Retry(
+            total=3,
+            backoff_factor=2,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset({"GET"}),
+            raise_on_status=False,
+        )
+        self.session.mount("https://", HTTPAdapter(max_retries=retry))
 
     def _paginate_projects(
         self,
         last_updated_from: str | None = None,
         last_updated_to: str | None = None,
         order_by: str = "last_updated",
-    ) -> list[dict[str, Any]]:
-        """Paginate through project list pages with the given filters."""
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Paginate through project list pages with the given filters.
+
+        Returns the projects found and the number of pages skipped because the
+        API answered 400 (a known TM bug on pages holding corrupted projects).
+        Any other error raises DiscoveryError, since a silently truncated list
+        would look like mass project removal to full discovery.
+        """
         all_projects = []
         page = 1
         total_pages = None
+        skipped_pages = 0
+        consecutive_bad_pages = 0
         while True:
             params = {
                 "orderBy": order_by,
@@ -282,23 +314,26 @@ class HOTApiClient:
                 data = response.json()
             except requests.HTTPError as e:
                 status_code = e.response.status_code
-                if status_code == 400:
-                    logger.warning(
-                        "API returned 400 at page %s (likely bad data on page). Skipping page.",
-                        page,
-                    )
-                    if total_pages is not None and page >= total_pages:
-                        break
-                    page += 1
-                    continue
-                else:
-                    logger.warning(
-                        "API returned %s at page %s, stopping pagination",
-                        status_code,
-                        page,
-                    )
+                if status_code != 400:
+                    raise DiscoveryError(
+                        f"API returned {status_code} at page {page}"
+                    ) from e
+                logger.warning(
+                    "API returned 400 at page %s (likely bad data on page). Skipping page.",
+                    page,
+                )
+                skipped_pages += 1
+                consecutive_bad_pages += 1
+                if consecutive_bad_pages >= MAX_CONSECUTIVE_BAD_PAGES:
+                    raise DiscoveryError(
+                        f"{consecutive_bad_pages} consecutive pages returned 400 (last page {page})"
+                    ) from e
+                if total_pages is not None and page >= total_pages:
                     break
+                page += 1
+                continue
 
+            consecutive_bad_pages = 0
             results = data.get("results", [])
             if not results:
                 break
@@ -312,7 +347,7 @@ class HOTApiClient:
 
             page += 1
 
-        return all_projects
+        return all_projects, skipped_pages
 
     def get_projects_summary(
         self, last_updated_from: str | None = None
@@ -326,7 +361,7 @@ class HOTApiClient:
         """
         if last_updated_from:
             logger.info("Starting incremental discovery from %s", last_updated_from)
-            projects = self._paginate_projects(last_updated_from=last_updated_from)
+            projects, _ = self._paginate_projects(last_updated_from=last_updated_from)
             logger.info("Found %s projects in incremental discovery", len(projects))
             return projects
 
@@ -336,28 +371,34 @@ class HOTApiClient:
         all_projects = []
         seen_ids: set[int] = set()
 
-        from datetime import datetime, timezone
         current_year = datetime.now(timezone.utc).year
         for year in range(2012, current_year + 1):
             year_from = f"{year}-01-01"
             year_to = f"{year}-12-31"
-            
-            # First pass: sort by last_updated
-            year_projects_1 = self._paginate_projects(
+
+            year_projects, skipped_pages = self._paginate_projects(
                 last_updated_from=year_from,
                 last_updated_to=year_to,
                 order_by="last_updated",
             )
-            
-            # Second pass: sort by id (rescues valid projects stuck on broken pages in the first pass)
-            year_projects_2 = self._paginate_projects(
-                last_updated_from=year_from,
-                last_updated_to=year_to,
-                order_by="id",
-            )
-            
+
+            # Pages that returned 400 hide valid projects too. A second pass
+            # sorted by id puts them on different pages and rescues them.
+            if skipped_pages:
+                logger.info(
+                    "Full discovery %d: %d pages skipped, re-querying sorted by id",
+                    year,
+                    skipped_pages,
+                )
+                rescue_projects, _ = self._paginate_projects(
+                    last_updated_from=year_from,
+                    last_updated_to=year_to,
+                    order_by="id",
+                )
+                year_projects += rescue_projects
+
             new_count = 0
-            for p in year_projects_1 + year_projects_2:
+            for p in year_projects:
                 pid = p.get("projectId")
                 if pid and pid not in seen_ids:
                     seen_ids.add(pid)
@@ -366,7 +407,7 @@ class HOTApiClient:
             logger.info(
                 "Full discovery %d: %d projects (%d new, %d total)",
                 year,
-                len(year_projects_1) + len(year_projects_2),
+                len(year_projects),
                 new_count,
                 len(all_projects),
             )
@@ -391,6 +432,9 @@ class StateManager:
         self.aggregate_dirty = False
         self.last_aggregate_build_at: str | None = None
         self.last_full_discovery_at: str | None = None
+        # Projects listed by the API whose detail fetch keeps failing. They are
+        # retried every run without holding back discovery or aggregate state.
+        self.failed_projects: dict[str, dict[str, Any]] = {}
 
     @staticmethod
     def _is_legacy_state(payload: Any) -> bool:
@@ -419,6 +463,7 @@ class StateManager:
                 self.aggregate_dirty = False
                 self.last_aggregate_build_at = None
                 self.last_full_discovery_at = None
+                self.failed_projects = {}
                 logger.info(
                     "Loaded legacy state from %s with %s projects",
                     source_key,
@@ -449,13 +494,24 @@ class StateManager:
                 if isinstance(last_full_discovery_at, str)
                 else None
             )
+            failed_projects = payload.get("failedProjects", {})
+            self.failed_projects = (
+                {
+                    str(k): v
+                    for k, v in failed_projects.items()
+                    if isinstance(v, dict)
+                }
+                if isinstance(failed_projects, dict)
+                else {}
+            )
 
             logger.info(
-                "Loaded state from %s with %s projects (aggregate dirty: %s, last full discovery: %s)",
+                "Loaded state from %s with %s projects (aggregate dirty: %s, last full discovery: %s, failing projects: %s)",
                 source_key,
                 len(self.project_timestamps),
                 self.aggregate_dirty,
                 self.last_full_discovery_at or "never",
+                len(self.failed_projects),
             )
         else:
             logger.info(
@@ -467,6 +523,7 @@ class StateManager:
             self.aggregate_dirty = False
             self.last_aggregate_build_at = None
             self.last_full_discovery_at = None
+            self.failed_projects = {}
 
     def save(self) -> None:
         """Save state to S3."""
@@ -479,6 +536,8 @@ class StateManager:
             payload["lastAggregateBuildAt"] = self.last_aggregate_build_at
         if self.last_full_discovery_at:
             payload["lastFullDiscoveryAt"] = self.last_full_discovery_at
+        if self.failed_projects:
+            payload["failedProjects"] = self.failed_projects
 
         self.s3_client.put_object(
             STATE_FILE_KEY,
@@ -514,9 +573,31 @@ class StateManager:
         """Remove projects from sync state and return the number removed."""
         removed = 0
         for project_id in project_ids:
+            self.failed_projects.pop(str(project_id), None)
             if self.project_timestamps.pop(str(project_id), None) is not None:
                 removed += 1
         return removed
+
+    def record_failure(
+        self, project_id: int, last_updated: str, error: str, failed_at: str
+    ) -> None:
+        """Remember a project whose detail fetch failed so later runs retry it."""
+        previous = self.failed_projects.get(str(project_id), {})
+        self.failed_projects[str(project_id)] = {
+            "lastUpdated": last_updated,
+            "error": error,
+            "attempts": int(previous.get("attempts", 0)) + 1,
+            "firstFailedAt": previous.get("firstFailedAt", failed_at),
+            "lastFailedAt": failed_at,
+        }
+
+    def clear_failure(self, project_id: int) -> None:
+        """Forget a previous fetch failure once the project fetches cleanly."""
+        self.failed_projects.pop(str(project_id), None)
+
+    def get_failed_project_ids(self) -> set[int]:
+        """Return project IDs whose last detail fetch failed."""
+        return {int(k) for k in self.failed_projects if k.isdigit()}
 
     def get_known_project_ids(self) -> set[int]:
         """Return project IDs currently tracked in sync state."""
@@ -763,7 +844,7 @@ def generate_pmtiles(geojson_path: Path, output_path: Path) -> bool:
     ]
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
         logger.info("PMTiles generation complete")
         return True
     except subprocess.CalledProcessError as e:
@@ -774,8 +855,70 @@ def generate_pmtiles(geojson_path: Path, output_path: Path) -> bool:
         return False
 
 
-def run_etl():
-    """Main ETL process."""
+def finish_report(
+    report: dict[str, Any], state_manager: StateManager, now: datetime
+) -> dict[str, Any]:
+    """Attach end-of-run state to the report and flag anything needing attention."""
+    report["aggregateDirty"] = state_manager.aggregate_dirty
+    report["lastAggregateBuildAt"] = state_manager.last_aggregate_build_at
+    report["lastFullDiscoveryAt"] = state_manager.last_full_discovery_at
+    report["failedProjects"] = dict(sorted(state_manager.failed_projects.items()))
+    problems = report.setdefault("problems", [])
+
+    if state_manager.aggregate_dirty:
+        last_build = parse_iso8601_timestamp(state_manager.last_aggregate_build_at)
+        if last_build is None or now - last_build > timedelta(
+            days=MAX_AGGREGATE_STALENESS_DAYS
+        ):
+            problems.append(
+                f"Aggregate files have not been rebuilt cleanly since {state_manager.last_aggregate_build_at or 'ever'}"
+            )
+
+    last_discovery = parse_iso8601_timestamp(state_manager.last_full_discovery_at)
+    if last_discovery is None or now - last_discovery > timedelta(
+        days=FULL_DISCOVERY_INTERVAL_DAYS + MAX_AGGREGATE_STALENESS_DAYS
+    ):
+        problems.append(
+            f"Full discovery has not completed since {state_manager.last_full_discovery_at or 'ever'}"
+        )
+    return report
+
+
+def write_job_summary(report: dict[str, Any]) -> None:
+    """Write a short Markdown run summary to the GitHub Actions job page."""
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not summary_path:
+        return
+
+    lines = [
+        "## Insta-TM sync",
+        "",
+        "| | |",
+        "|---|---|",
+        f"| Discovery | {report.get('discovery')} ({report.get('discovered', 0)} projects listed) |",
+        f"| Projects updated | {report.get('updated', 0)} |",
+        f"| Projects removed | {report.get('removed', 0)} |",
+        f"| Aggregate features | {report.get('features', 'not rebuilt')} |",
+        f"| Aggregate dirty | {report.get('aggregateDirty')} (last clean build {report.get('lastAggregateBuildAt') or 'never'}) |",
+        f"| Last full discovery | {report.get('lastFullDiscoveryAt') or 'never'} |",
+    ]
+    failed = report.get("failedProjects") or {}
+    if failed:
+        lines += ["", "### Projects the TM API keeps failing to return", ""]
+        lines += [
+            f"- {pid}: {info.get('error')} ({info.get('attempts')} attempts since {info.get('firstFailedAt')})"
+            for pid, info in failed.items()
+        ]
+    problems = report.get("problems") or []
+    if problems:
+        lines += ["", "### Problems", ""] + [f"- {problem}" for problem in problems]
+
+    with open(summary_path, "a", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def run_etl() -> dict[str, Any]:
+    """Main ETL process. Returns a run report for the job summary."""
     logger.info("Starting HOT Tasking Manager Cloud Native Mirror ETL")
     run_started_at = datetime.now(timezone.utc)
     run_started_at_str = run_started_at.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -790,6 +933,10 @@ def run_etl():
 
     incremental_start = state_manager.get_incremental_sync_start()
     full_discovery = state_manager.full_discovery_due(run_started_at)
+    report: dict[str, Any] = {
+        "discovery": "full" if full_discovery else "incremental",
+        "problems": [],
+    }
 
     if full_discovery:
         logger.info(
@@ -819,6 +966,16 @@ def run_etl():
             if state_manager.needs_update(project_id, last_updated):
                 projects_to_update.append((project_id, last_updated))
 
+    # Incremental discovery only sees recently updated projects, so retry
+    # earlier fetch failures explicitly. Full discovery already lists them.
+    if not full_discovery:
+        queued_ids = {project_id for project_id, _ in projects_to_update}
+        for project_id in sorted(state_manager.get_failed_project_ids() - queued_ids):
+            last_updated = state_manager.failed_projects[str(project_id)].get("lastUpdated")
+            if last_updated:
+                projects_to_update.append((project_id, last_updated))
+
+    report["discovered"] = len(projects_summary)
     logger.info(f"{len(projects_to_update)} projects need updating")
     if state_manager.needs_aggregate_rebuild():
         logger.info("Aggregate artifacts are marked dirty and will be rebuilt")
@@ -826,7 +983,7 @@ def run_etl():
     # Fetch and upload updated project details
     updated_projects = {}  # project_id -> details
     successful_uploads = 0
-    failed_project_updates = 0
+    failed_this_run: set[int] = set()
     uploads_since_checkpoint = 0
     for i, (project_id, last_updated) in enumerate(projects_to_update, 1):
         try:
@@ -846,6 +1003,7 @@ def run_etl():
             )
 
             state_manager.mark_updated(project_id, last_updated)
+            state_manager.clear_failure(project_id)
             state_manager.mark_aggregate_dirty()
             updated_projects[project_id] = details
             successful_uploads += 1
@@ -862,10 +1020,18 @@ def run_etl():
 
         except requests.RequestException as e:
             logger.error(f"Failed to fetch project {project_id}: {e}")
-            failed_project_updates += 1
+            status_code = getattr(getattr(e, "response", None), "status_code", None)
+            state_manager.record_failure(
+                project_id,
+                last_updated,
+                f"HTTP {status_code}" if status_code else type(e).__name__,
+                run_started_at_str,
+            )
+            failed_this_run.add(project_id)
             continue
 
-    if uploads_since_checkpoint:
+    report["updated"] = successful_uploads
+    if uploads_since_checkpoint or failed_this_run:
         state_manager.save()
         logger.info(
             "Checkpointed state after %s project uploads", successful_uploads
@@ -881,6 +1047,7 @@ def run_etl():
         feature_map = {}
 
     cached_feature_count = len(feature_map)
+    removed_from_state = 0
 
     if full_discovery:
         current_project_ids = {
@@ -893,7 +1060,26 @@ def run_etl():
             for project in projects_summary
             if isinstance(project.get("projectId"), int)
         }
-        ids_to_remove = state_manager.get_known_project_ids() - current_project_ids
+        known_project_ids = state_manager.get_known_project_ids()
+        ids_to_remove = known_project_ids - current_project_ids
+        discovery_trusted = len(ids_to_remove) <= MAX_REMOVALS_PER_DISCOVERY
+        if not discovery_trusted:
+            message = (
+                f"Full discovery would remove {len(ids_to_remove)} projects "
+                f"(limit {MAX_REMOVALS_PER_DISCOVERY}); kept them and left discovery incomplete"
+            )
+            logger.error(message)
+            report["problems"].append(message)
+            # Keep the unlisted projects as if discovery had returned them unchanged.
+            for project_id in ids_to_remove:
+                summary_last_updated[project_id] = state_manager.project_timestamps.get(
+                    str(project_id)
+                )
+            current_project_ids |= ids_to_remove
+            ids_to_remove = set()
+        # Failures for projects that are no longer listed are moot.
+        for project_id in state_manager.get_failed_project_ids() - current_project_ids:
+            state_manager.clear_failure(project_id)
         removed_from_state = state_manager.remove_projects(ids_to_remove)
         if removed_from_state:
             logger.info(
@@ -923,7 +1109,9 @@ def run_etl():
         # fails during the rebuild phase.
         if removed_from_state or removed_projects:
             state_manager.mark_aggregate_dirty()
-        if failed_project_updates == 0:
+        # Projects whose detail fetch failed are tracked in failedProjects and
+        # retried every run, so they no longer hold the discovery marker back.
+        if discovery_trusted:
             state_manager.mark_full_discovery(run_started_at_str)
             state_manager.save()
             logger.info("Full discovery marked complete (removals + discovery persisted)")
@@ -948,6 +1136,7 @@ def run_etl():
             project_id: summary_last_updated.get(project_id)
             for project_id in current_project_ids
         }
+        project_ids_to_refresh -= failed_this_run
         aggregate_rebuild_required = bool(project_ids_to_refresh) or bool(
             removed_projects
         ) or state_manager.needs_aggregate_rebuild()
@@ -975,6 +1164,7 @@ def run_etl():
             project_id: state_manager.project_timestamps.get(str(project_id))
             for project_id in known_project_ids
         }
+        project_ids_to_refresh -= failed_this_run
         aggregate_rebuild_required = bool(project_ids_to_refresh) or state_manager.needs_aggregate_rebuild()
 
     if not projects_to_update and not aggregate_rebuild_required:
@@ -983,12 +1173,12 @@ def run_etl():
             state_manager.save()
         logger.info("No changes detected, skipping uploads")
         logger.info("ETL complete!")
-        return
+        return finish_report(report, state_manager, datetime.now(timezone.utc))
 
     if not updated_projects and not aggregate_rebuild_required:
         logger.warning("No project updates were uploaded successfully, skipping rebuild")
         logger.info("ETL complete!")
-        return
+        return finish_report(report, state_manager, datetime.now(timezone.utc))
 
     if project_ids_to_refresh:
         logger.info(
@@ -1025,12 +1215,15 @@ def run_etl():
                 if removed:
                     s3_client.delete_objects([f"api/v2/projects/{project_id}"])
                     state_manager.mark_aggregate_dirty()
+                    removed_from_state += removed
                 continue
             logger.warning(f"Could not process project {project_id}: {e}")
             refresh_failures += 1
             continue
 
     features = [feature_map[project_id] for project_id in sorted(feature_map)]
+    report["removed"] = removed_from_state
+    report["features"] = len(features)
 
     feature_collection = {"type": "FeatureCollection", "features": features}
     logger.info(f"Created FeatureCollection with {len(features)} features")
@@ -1089,12 +1282,11 @@ def run_etl():
                 cache_control="public, max-age=3600",
             )
             logger.info(f"Uploaded {PMTILES_OUTPUT} ({len(pmtiles_data) / 1024 / 1024:.1f} MB)")
-            if refresh_failures == 0 and failed_project_updates == 0:
+            if refresh_failures == 0:
                 aggregate_success = True
             else:
                 logger.warning(
-                    "Aggregate rebuild remains dirty because %s project updates failed and %s project features could not be refreshed",
-                    failed_project_updates,
+                    "Aggregate rebuild remains dirty because %s project features could not be refreshed",
                     refresh_failures,
                 )
         else:
@@ -1107,6 +1299,7 @@ def run_etl():
         logger.warning("Aggregate rebuild incomplete; retry will resume from cached state")
 
     logger.info("ETL complete!")
+    return finish_report(report, state_manager, datetime.now(timezone.utc))
 
 
 def validate_env():
@@ -1121,4 +1314,9 @@ def validate_env():
 
 if __name__ == "__main__":
     validate_env()
-    run_etl()
+    run_report = run_etl()
+    write_job_summary(run_report)
+    for problem in run_report["problems"]:
+        logger.error("Health check: %s", problem)
+    if run_report["problems"]:
+        sys.exit(1)

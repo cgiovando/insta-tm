@@ -122,12 +122,14 @@ const map = new maplibregl.Map({
 
 1. **GitHub Actions** runs the ETL script daily (06:00 UTC), with a concurrency guard to prevent overlapping runs
 2. Most daily runs query the HOT Tasking Manager API with `lastUpdatedFrom` and a 1-day safety overlap instead of crawling the full project corpus
-3. A periodic full discovery pass (every 14 days) reconciles removals and long-missed drift
+3. A periodic full discovery pass (every 14 days) reconciles removals and long-missed drift. A pass that would remove an implausible number of projects is treated as an API fault and removes nothing
 4. Changed projects are fetched, trimmed to essential fields, and uploaded as lean JSON files
 5. If changes were detected, the existing aggregate GeoJSON is patched in place and only stale or missing features are rebuilt from the project detail cache
 6. **Tippecanoe** generates PMTiles with a curated set of map-rendering properties
 7. Aggregate files are uploaded with gzip compression and Cache-Control headers
 8. If no changes are detected and aggregate artifacts are already current, the script exits early
+9. Projects the Tasking Manager API fails to return are recorded in the sync state and retried on every run, without holding back the rest of the mirror
+10. Each run writes a summary to the GitHub Actions job page, and the run fails if the mirror falls more than a few days behind
 
 ## Tech Stack
 
